@@ -1,0 +1,243 @@
+/**
+ * STA Mode Stream for M5Stack Timer Camera X (Joins Home WiFi with Timeout)
+ * Falls back to AP if connection fails
+ * Stream at http://[camera-ip]/stream
+ * Added: Battery level check before WiFi connect
+ * Added: Battery level displayed and auto-updated on the web page
+ */
+#include "M5TimerCAM.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include <WiFi.h>
+#include <esp_log.h>
+#include <esp_timer.h>
+
+// Home WiFi Credentials (DOUBLE-CHECK THESE - Case-sensitive!)
+const char* ssid = "itel RS4"; // e.g., "MyHomeWiFi" (2.4GHz only)
+const char* password = "12345678"; // e.g., "MySecurePass"
+
+WiFiServer server(80);
+
+// Forward declarations
+static void jpegStream(WiFiClient* client);
+static void streamTask(void* pvParameters);
+
+TaskHandle_t streamTaskHandle = nullptr;
+
+void setup() {
+    Serial.begin(115200);
+    delay(2000);
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+    Serial.println("Starting Timer Camera X STA Mode...");
+    
+    // Battery level check before WiFi connect
+    TimerCAM.begin();
+    int16_t batteryLevel = TimerCAM.Power.getBatteryLevel();
+    Serial.print("Battery Level: ");
+    Serial.print(batteryLevel);
+    Serial.println("%");
+    
+    if (!TimerCAM.Camera.begin()) {
+        Serial.println("Camera Init Fail");
+        while (1) delay(1000);
+    }
+    Serial.println("Camera Init Success");
+    
+    // Camera config
+    TimerCAM.Camera.sensor->set_pixformat(TimerCAM.Camera.sensor, PIXFORMAT_JPEG);
+    TimerCAM.Camera.sensor->set_framesize(TimerCAM.Camera.sensor, FRAMESIZE_VGA); // mid-res for testing
+    TimerCAM.Camera.sensor->set_vflip(TimerCAM.Camera.sensor, 1);
+    TimerCAM.Camera.sensor->set_hmirror(TimerCAM.Camera.sensor, 0);
+    
+    // STA Setup with Timeout (30s max)
+    WiFi.begin(ssid, password);
+    Serial.print("Connecting to WiFi");
+    int attempts = 0;
+    const int maxAttempts = 60; // 30 seconds (500ms * 60)
+    while (WiFi.status() != WL_CONNECTED && attempts < maxAttempts) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+    Serial.println(); // New line
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.print("WiFi connected! IP: ");
+        Serial.println(WiFi.localIP());
+        Serial.println("RSSI: " + String(WiFi.RSSI()) + " dBm (signal strength)");
+    } else {
+        Serial.println("WiFi connection failed (status: " + String(WiFi.status()) + ") - Falling back to AP mode");
+        // Fallback to AP (hotspot)
+        WiFi.softAP("TimerCAM-Fallback", "12345678");
+        IPAddress IP = WiFi.softAPIP();
+        Serial.print("AP Fallback IP: ");
+        Serial.println(IP);
+    }
+    
+    server.begin();
+    Serial.println("Server started - Stream at http://[IP]/stream");
+    Serial.println("Check phone browser for live view!");
+}
+
+void loop() {
+    WiFiClient client = server.available();
+    if (client) {
+        Serial.println("New Client");
+        String req = client.readStringUntil('\r');
+        client.flush();
+        
+        if (req.indexOf("GET /battery") >= 0) {
+            int16_t batteryLevel = TimerCAM.Power.getBatteryLevel();
+            client.println("HTTP/1.1 200 OK");
+            client.println("Content-Type: application/json");
+            client.println("Access-Control-Allow-Origin: *");
+            client.println("Connection: close");
+            client.println();
+            client.print("{\"batteryPercent\":");
+            client.print(batteryLevel);
+            client.print("}");
+        }
+        else if (req.indexOf("GET /stream") >= 0) {
+            if (streamTaskHandle != nullptr) {
+                client.println("HTTP/1.1 503 Service Unavailable");
+                client.println("Content-Type: text/plain");
+                client.println("Connection: close");
+                client.println();
+                client.println("Stream already active");
+            } else {
+                WiFiClient* streamClient = new WiFiClient(client);
+                if (xTaskCreatePinnedToCore(streamTask, "streamTask", 8192, streamClient, 1, &streamTaskHandle, 1) != pdPASS) {
+                    client.println("HTTP/1.1 500 Internal Server Error");
+                    client.println("Content-Type: text/plain");
+                    client.println("Connection: close");
+                    client.println();
+                    client.println("Failed to start stream");
+                    delete streamClient;
+                }
+            }
+        }
+        else {
+            // Root page (/) - Show live stream + battery level
+            int16_t batteryLevel = TimerCAM.Power.getBatteryLevel(); // Initial value
+            
+            client.println("HTTP/1.1 200 OK");
+            client.println("Content-Type: text/html");
+            client.println("Connection: close");
+            client.println();
+            
+            client.println("<!DOCTYPE html>");
+            client.println("<html>");
+            client.println("<head>");
+            client.println("<title>TimerCAM Stream</title>");
+            client.println("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
+            client.println("<style>");
+            client.println("body { font-family: Arial, sans-serif; text-align: center; background: #111; color: #fff; margin: 0; padding: 10px; }");
+            client.println("h1 { margin: 10px 0; }");
+            client.println("#battery { font-size: 2em; font-weight: bold; color: #0f0; margin: 10px 0; }");
+            client.println("img { width: 100%; max-width: 800px; border: 2px solid #444; border-radius: 8px; }");
+            client.println("</style>");
+            client.println("</head>");
+            client.println("<body>");
+            client.println("<h1>TimerCAM Live Stream</h1>");
+            client.println("<div>Battery: <span id=\"battery\">");
+            client.print(batteryLevel);
+            client.println("%</span></div>");
+            client.println("<img src=\"/stream\">");
+            
+            client.println("<script>");
+            client.println("function updateBattery() {");
+            client.println("  fetch('/battery')");
+            client.println("    .then(response => response.json())");
+            client.println("    .then(data => {");
+            client.println("      document.getElementById('battery').innerText = data.batteryPercent + '%';");
+            client.println("      // Optional: change color if low");
+            client.println("      let el = document.getElementById('battery');");
+            client.println("      if (data.batteryPercent < 20) el.style.color = '#f00';");
+            client.println("      else if (data.batteryPercent < 50) el.style.color = '#ff0';");
+            client.println("      else el.style.color = '#0f0';");
+            client.println("    })");
+            client.println("    .catch(err => {");
+            client.println("      document.getElementById('battery').innerText = 'Error';");
+            client.println("    });");
+            client.println("}");
+            client.println("// Update immediately and every 10 seconds");
+            client.println("updateBattery();");
+            client.println("setInterval(updateBattery, 10000);");
+            client.println("</script>");
+            
+            client.println("</body>");
+            client.println("</html>");
+        }
+        
+        if (req.indexOf("GET /stream") < 0) {
+            client.stop();
+            Serial.println("Client Disconnected");
+        }
+    }
+    delay(1);
+}
+
+// JPEG Stream Function (unchanged)
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+static void jpegStream(WiFiClient* client) {
+    Serial.println("Stream start");
+    client->println("HTTP/1.1 200 OK");
+    client->printf("Content-Type: %s\r\n", _STREAM_CONTENT_TYPE);
+    client->println("Access-Control-Allow-Origin: *");
+    client->println();
+    
+    static int64_t last_frame = 0;
+    if (!last_frame) last_frame = esp_timer_get_time();
+    
+    for (;;) {
+        if (TimerCAM.Camera.get()) {
+            // LED disabled for power savings
+            // TimerCAM.Power.setLed(255);
+            
+            client->print(_STREAM_BOUNDARY);
+            client->printf(_STREAM_PART, TimerCAM.Camera.fb->len);
+            
+            int32_t to_send = TimerCAM.Camera.fb->len;
+            uint8_t* buf = TimerCAM.Camera.fb->buf;
+            uint32_t chunk = 8 * 1024;
+            
+            while (to_send > 0) {
+                uint32_t send_now = (to_send > chunk) ? chunk : to_send;
+                if (client->write(buf, send_now) != send_now) {
+                    goto client_exit;
+                }
+                buf += send_now;
+                to_send -= send_now;
+            }
+            
+            int64_t fr_end = esp_timer_get_time();
+            int64_t frame_time = (fr_end - last_frame) / 1000;
+            last_frame = fr_end;
+            Serial.printf("MJPG: %luKB %lums (%.1ffps)\r\n",
+                          (TimerCAM.Camera.fb->len / 1024), frame_time, 1000.0f / frame_time);
+            
+            TimerCAM.Camera.free();
+            // TimerCAM.Power.setLed(0);
+        }
+    }
+    
+client_exit:
+    TimerCAM.Camera.free();
+    // TimerCAM.Power.setLed(0);
+    client->stop();
+    Serial.println("Stream end");
+}
+
+static void streamTask(void* pvParameters) {
+    WiFiClient* client = reinterpret_cast<WiFiClient*>(pvParameters);
+    if (client) {
+        jpegStream(client);
+        delete client;
+    }
+    streamTaskHandle = nullptr;
+    vTaskDelete(nullptr);
+}

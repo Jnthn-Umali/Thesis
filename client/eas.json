@@ -1,0 +1,28 @@
+{
+  "cli": {
+    "version": ">= 16.31.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal"
+    },
+    "preview": {
+      "distribution": "internal",
+      "android": {
+        "buildType": "apk"
+      }
+    },
+    "production": {
+      "autoIncrement": true,
+      "env": {
+        "EXPO_PUBLIC_SERVER_URL": "http://52.184.84.189",
+        "EXPO_PUBLIC_M5TIMER_CAMERA_IP": "10.202.11.186"
+      }
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}
