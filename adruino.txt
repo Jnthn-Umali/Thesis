@@ -13,7 +13,7 @@
 #include <esp_timer.h>
 
 // Home WiFi Credentials (DOUBLE-CHECK THESE - Case-sensitive!)
-const char* ssid = "itel RS4"; // e.g., "MyHomeWiFi" (2.4GHz only)
+const char* ssid = "myhomewifi"; // e.g., "MyHomeWiFi" (2.4GHz only)
 const char* password = "12345678"; // e.g., "MySecurePass"
 
 WiFiServer server(80);
